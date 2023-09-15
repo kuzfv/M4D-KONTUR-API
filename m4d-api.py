@@ -13,11 +13,14 @@ class CustomError(Exception):
     """Класс для описания ошибок"""
 
 
-def base64_encoder(filepath):
+def base64_encoder(filepath, decode=False):
     """Конвертация контента файла в Base64"""
 
     with open(filepath, "rb") as file:
-        return base64.b64encode(file.read())
+        if decode:
+            return base64.b64encode(file.read()).decode()
+        else:
+            return base64.b64encode(file.read())
 
 
 def to_camel_case_converter(string):
@@ -118,53 +121,60 @@ def get_revocation_xml_file(poa_number, reason=None):
         xml.write(req.content)
 
 
-def validation_poa_requisites(principal, representative, poa_identity={},
-                              thumbprint=None, certificate_path=None, poa_path=None, signature_path=None,
-                              sync_timeout_ms=1000):  # Позже. Слишком много вариантов - 6
+def validation_poa(principal: dict, poa_identity={}, representative={},
+                   thumbprint=None, certificate_path=None, poa_files=[],
+                   sync_timeout_ms=1000):
     """Валидация МЧД"""
-
-    """
-poaIdentity + thumbprint
-poaIdentity + body
-poaIdentity + requisites
-
-poaFiles + thumbprint
-poaFiles + body
-poaFiles + requisites
-    """
 
     payload = {
         "parameters": {
-            "poaIdentity": {
-                "number": poa_identity.get("number"),
-                "principalInn": poa_identity.get("inn")
-            },
+            "poaIdentity": None,
             "principal": {
                 "inn": principal["inn"],
                 "kpp": principal["kpp"]
             },
             "representative": {
-                "requisites": {
-                    "name": representative["name"],
-                    "surname": representative["surname"],
-                    "middlename": representative["middlename"],
-                    "snils": representative["snils"],
-                    "inn": representative["inn"],
-                    "innUl": representative.get("innUl"),
-                    "kpp": representative.get("kpp")
-                },
-                "certificate": {
-                    "thumbprint": thumbprint,
-                    "body": certificate_path
-                }
+                "requisites": {},
+                "certificate": {}
             }
         },
-        "poaFiles": {
-            "poaContent": base64_encoder(poa_path),
-            "signatureContent": base64_encoder(signature_path)
-        },
+        "poaFiles": {},
         "syncTimeoutMs": sync_timeout_ms
     }
+
+    # Сначала валидация переданных параметров
+    if not poa_files:
+        if not poa_identity:
+            raise CustomError("Должен быть указан параметр 'poaIdentity' или 'poaFiles'")
+        payload["parameters"]["poaIdentity"] = {"number": poa_identity["number"],
+                                                "principalInn": poa_identity["inn"]}
+        payload["poaFiles"] = None
+    else:
+        if poa_identity:
+            raise CustomError("Должен быть указан только один параметр 'poaIdentity' или 'poaFiles'")
+        payload["poaFiles"] = {"poaContent": base64_encoder(poa_files[0], True),
+                               "signatureContent": base64_encoder(poa_files[1], True)}
+        payload["poaIdentity"] = None
+
+    if not representative:
+        if not thumbprint:
+            if not certificate_path:
+                raise CustomError("Должен быть указан параметр 'representative', 'thumbprint' или 'certificate_path'")
+            else:
+                payload["parameters"]["representative"]["certificate"]["body"] = base64_encoder(certificate_path, True)
+                payload["parameters"]["representative"]["requisites"] = None
+        else:
+            if certificate_path:
+                raise CustomError("Должен быть указан только один параметр 'thumbprint' или 'certificate_path'")
+            payload["parameters"]["representative"]["certificate"]["thumbprint"] = thumbprint
+            payload["parameters"]["representative"]["requisites"] = None
+    else:
+        if thumbprint:
+            raise CustomError("Должен быть указан только один параметр 'representative' или 'thumbprint'")
+        if certificate_path:
+            raise CustomError("Должен быть указан только один параметр 'representative' или 'certificate_path'")
+        payload["parameters"]["representative"]["requisites"] = representative
+        payload["parameters"]["representative"]["certificate"] = None
 
     req = requests.post(f"{URL}/v1/organizations/{organization_id}/poas/validate-local",
                         headers={"X-KONTUR-APIKEY": APIKEY},
@@ -186,11 +196,11 @@ def create_xml_from_json(json_data, filename="poa"):
         poa.write(req.content)
 
 
-def create_xml_from_json_file(json_filepath):
+def create_xml_from_json_file(json_filepath, filename="poa"):
     """Формирование XML файла МЧД из JSON файла"""
 
     with open(json_filepath, "rb") as file:
-        generate_xml_from_json(json.loads(file.read()))
+        create_xml_from_json(json.loads(file.read()), filename)
 
 
 def create_draft_from_xml_file(path_to_file, send_to_sign=False):
@@ -336,16 +346,84 @@ def async_revocation(revocation_file_path, signature_path, polling_time_sec=1):
                            headers={"X-Kontur-Apikey": APIKEY})
         if req.status_code != 200:
             raise CustomError(f"Unsuccessful HTTP request /revocations/operation_id. {req.text}")
-        print(req.json()['status'])
         if req.json()['status'] in ("done", "error"):
             return req.json()
         time.sleep(polling_time_sec)
 
 
-def async_validation():  # Позже. Слишком много вариантов - 6
+def async_validation(principal: dict, poa_identity={}, representative={},
+                     thumbprint=None, certificate_path=None, poa_files=[],
+                     polling_time_sec=1):
     """Валидация МЧД"""
-    pass
+
+    payload = {
+        "parameters": {
+            "poaIdentity": None,
+            "principal": {
+                "inn": principal["inn"],
+                "kpp": principal["kpp"]
+            },
+            "representative": {
+                "requisites": {},
+                "certificate": {}
+            }
+        },
+        "poaFiles": {}
+    }
+
+    # Сначала валидация переданных параметров
+    if not poa_files:
+        if not poa_identity:
+            raise CustomError("Должен быть указан параметр 'poaIdentity' или 'poaFiles'")
+        payload["parameters"]["poaIdentity"] = {"number": poa_identity["number"],
+                                                "principalInn": poa_identity["inn"]}
+        payload["poaFiles"] = None
+    else:
+        if poa_identity:
+            raise CustomError("Должен быть указан только один параметр 'poaIdentity' или 'poaFiles'")
+        payload["poaFiles"] = {"poaContent": base64_encoder(poa_files[0], True),
+                               "signatureContent": base64_encoder(poa_files[1], True)}
+        payload["poaIdentity"] = None
+
+    if not representative:
+        if not thumbprint:
+            if not certificate_path:
+                raise CustomError("Должен быть указан параметр 'representative', 'thumbprint' или 'certificate_path'")
+            else:
+                payload["parameters"]["representative"]["certificate"]["body"] = base64_encoder(certificate_path, True)
+                payload["parameters"]["representative"]["requisites"] = None
+        else:
+            if certificate_path:
+                raise CustomError("Должен быть указан только один параметр 'thumbprint' или 'certificate_path'")
+            payload["parameters"]["representative"]["certificate"]["thumbprint"] = thumbprint
+            payload["parameters"]["representative"]["requisites"] = None
+    else:
+        if thumbprint:
+            raise CustomError("Должен быть указан только один параметр 'representative' или 'thumbprint'")
+        if certificate_path:
+            raise CustomError("Должен быть указан только один параметр 'representative' или 'certificate_path'")
+        payload["parameters"]["representative"]["requisites"] = representative
+        payload["parameters"]["representative"]["certificate"] = None
+
+    req = requests.post(f"{URL}/v1/organizations/{organization_id}/operations/validations",
+                        headers={"X-Kontur-Apikey": APIKEY},
+                        json=payload)
+    if req.status_code != 201:
+        raise CustomError(f"Unsuccessful HTTP request /validations. {req.text}")
+    operation_id = req.json()["id"]
+
+    while True:
+        req = requests.get(f"{URL}/v1/organizations/{organization_id}/operations/validations/{operation_id}",
+                           headers={"X-Kontur-Apikey": APIKEY})
+        if req.status_code != 200:
+            raise CustomError(f"Unsuccessful HTTP request /revocations/operation_id. {req.text}")
+        if req.json()['status'] in ("done", "error"):
+            return req.json()
+        time.sleep(polling_time_sec)
 
 
 if __name__ == "__main__":
     organization_id = set_organization_id()
+    # poa_identity = {"number": "31cc6eee-b565-4266-9097-2a8ac00ff444", "inn": "4401165141"}
+    # principal = {"inn": "4401165141", "kpp": "440101001"}
+    # representative = {"name": "Иван", "surname": "Иванов", "snils": "252-639-136 73", "inn": "477704523710"}
