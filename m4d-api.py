@@ -1,8 +1,11 @@
+from requests import HTTPError
 import requests
 import base64
 import json
 import time
 import os
+import re
+
 
 URL = "https://m4d-api-staging.testkontur.ru"  # Staging
 # URL = "https://m4d-api.kontur.ru"  # Production
@@ -39,7 +42,7 @@ def get_organizations():
     organizations_req = requests.get(f"{URL}/v1/organizations",
                                      headers={"X-Kontur-Apikey": APIKEY})
     if organizations_req.status_code != 200:
-        raise CustomError(f"Unsuccessful HTTP request /organizations. {organizations_req.text}")
+        raise HTTPError(f"Unsuccessful HTTP request /organizations. {organizations_req.text}")
     if organizations_req.json()["totalCount"] == 0:
         raise CustomError("No organizations available. Please follow the instruction https://clck.ru/35aL5Z")
     return organizations_req.json()
@@ -76,7 +79,7 @@ def search_poas(sync_timeout_ms=1000, next_token=None, **params):
                        headers={"X-Kontur-Apikey": APIKEY},
                        params={to_camel_case_converter(key): value for key, value in params.items()})
     if req.status_code != 200:
-        raise CustomError(f"Unsuccessful HTTP request /poas. {req.text}")
+        raise HTTPError(f"Unsuccessful HTTP request /poas.\n{req.text}")
     return req
 
 
@@ -87,18 +90,18 @@ def get_poa_metainfo(poa_number, sync_timeout_ms=1000):
                        headers={"X-KONTUR-APIKEY": APIKEY},
                        params={"SyncTimeoutMs": sync_timeout_ms})
     if req.status_code != 200:
-        raise CustomError(f"Unsuccessful HTTP request /poas/poa_number. {req.text}")
+        raise HTTPError(f"Unsuccessful HTTP request /poas/poa_number.\n{req.text}")
     return req.json()
 
 
 def get_archive(poa_number):
     """Получение архива с файлами МЧД"""
 
-    with open("./archive.zip", "wb") as archive:
+    with open(f"./poa_{poa_number}.zip", "wb") as archive:
         req = requests.get(f"{URL}/v1/organizations/{organization_id}/poas/{poa_number}/zip-archive",
                            headers={"X-KONTUR-APIKEY": APIKEY})
         if req.status_code != 200:
-            raise CustomError(f"Unsuccessful HTTP request /zip-archive. {req.text}")
+            raise HTTPError(f"Unsuccessful HTTP request /zip-archive.\n{req.text}")
         archive.write(req.content)
 
 
@@ -116,7 +119,7 @@ def get_revocation_xml_file(poa_number, reason=None):
                               "name": organization_info['fullName'],
                               "poaType": poa_info["poa"]['poaType']})
     if req.status_code != 200:
-        raise CustomError(f"Unsuccessful HTTP request /revocation/form-xml. {req.text}")
+        raise HTTPError(f"Unsuccessful HTTP request /revocation/form-xml.\n{req.text}")
     with open(f"./revocation_poa_{poa_number}.xml", "wb") as xml:
         xml.write(req.content)
 
@@ -180,7 +183,7 @@ def validation_poa(principal: dict, poa_identity={}, representative={},
                         headers={"X-KONTUR-APIKEY": APIKEY},
                         json=payload)
     if req.status_code != 200:
-        raise CustomError(f"Unsuccessful HTTP request /validate-local. {req.text}")
+        raise HTTPError(f"Unsuccessful HTTP request /validate-local.\n{req.text}")
     return req.json()
 
 
@@ -191,7 +194,7 @@ def create_xml_from_json(json_data, filename="poa"):
                         headers={"X-KONTUR-APIKEY": APIKEY},
                         json=json_data)
     if req.status_code != 200:
-        raise CustomError(f"Unsuccessful HTTP request /form-xml. {req.text}")
+        raise HTTPError(f"Unsuccessful HTTP request /form-xml.\n{req.text}")
     with open(f"./{filename}.xml", "wb") as poa:
         poa.write(req.content)
 
@@ -212,7 +215,7 @@ def create_draft_from_xml_file(path_to_file, send_to_sign=False):
                             data={"sendToSign": send_to_sign},
                             files={"poa": xml.read()})
     if req.status_code != 200:
-        raise CustomError(f"Unsuccessful HTTP request /drafts. {req.text}")
+        raise HTTPError(f"Unsuccessful HTTP request /drafts.\n{req.text}")
     return req.json()["draftId"]
 
 
@@ -229,14 +232,14 @@ def async_registration(poa_path, signature_path, polling_time_sec=1):
                             headers={"X-Kontur-Apikey": APIKEY},
                             files={"poa": poa.read(), "signature": sig.read()})
         if req.status_code != 201:
-            raise CustomError(f"Unsuccessful HTTP request /registrations. {req.text}")
+            raise HTTPError(f"Unsuccessful HTTP request /registrations.\n{req.text}")
     operation_id = req.json()["id"]
 
     while True:
         req = requests.get(f"{URL}/v1/organizations/{organization_id}/operations/registrations/{operation_id}",
                            headers={"X-Kontur-Apikey": APIKEY})
         if req.status_code != 200:
-            raise CustomError(f"Unsuccessful HTTP request /registrations/operation_id. {req.text}")
+            raise HTTPError(f"Unsuccessful HTTP request /registrations/operation_id.\n{req.text}")
         if req.json()['status'] in ("done", "error"):
             return req.json()
         time.sleep(polling_time_sec)
@@ -245,23 +248,23 @@ def async_registration(poa_path, signature_path, polling_time_sec=1):
 def async_download(number, principal_inn, inn, datatype="archive", polling_time_sec=1):
     """Скачивание МЧД"""
 
-    def return_meta(operation_id, filename="poa_archive"):
+    def return_meta(operation_id):
         """Получение метаинформации об МЧД"""
 
         req = requests.get(f"{URL}/v1/organizations/{organization_id}/operations/downloads/{operation_id}/meta",
                            headers={"X-Kontur-Apikey": APIKEY})
         if req.status_code != 200:
-            raise CustomError(f"Unsuccessful HTTP request /meta. {req.text}")
+            raise HTTPError(f"Unsuccessful HTTP request /meta.\n{req.text}")
         return req.json()
 
-    def create_archive(operation_id, filename="archive"):
+    def create_archive(operation_id):
         """Получение архива с файлами МЧД"""
 
         req = requests.get(f"{URL}//v1/organizations/{organization_id}/operations/downloads/{operation_id}/zip-archive",
                            headers={"X-Kontur-Apikey": APIKEY})
         if req.status_code != 200:
-            raise CustomError(f"Unsuccessful HTTP request /zip-archive. {req.text}")
-        with open(f"{filename}.zip", "wb") as archive:
+            raise HTTPError(f"Unsuccessful HTTP request /zip-archive.\n{req.text}")
+        with open(f"poa_{number}.zip", "wb") as archive:
             archive.write(req.content)
 
     payload = {
@@ -280,14 +283,14 @@ def async_download(number, principal_inn, inn, datatype="archive", polling_time_
                         headers={"X-Kontur-Apikey": APIKEY},
                         json=payload)
     if req.status_code != 201:
-        raise CustomError(f"Unsuccessful HTTP request /downloads. {req.text}")
+        raise HTTPError(f"Unsuccessful HTTP request /downloads.\n{req.text}")
     operation_id = req.json()["id"]
 
     while True:
         req = requests.get(f"{URL}/v1/organizations/{organization_id}/operations/downloads/{operation_id}",
                            headers={"X-Kontur-Apikey": APIKEY})
         if req.status_code != 200:
-            raise CustomError(f"Unsuccessful HTTP request /downloads/operation_id. {req.text}")
+            raise HTTPError(f"Unsuccessful HTTP request /downloads/operation_id.\n{req.text}")
         if req.json()['status'] == "done":
             if datatype == "archive":
                 return create_archive(operation_id)
@@ -317,14 +320,14 @@ def async_import(number, principal_inn, inn, polling_time_sec=1):
                         headers={"X-Kontur-Apikey": APIKEY},
                         json=payload)
     if req.status_code != 201:
-        raise CustomError(f"Unsuccessful HTTP request /imports. {req.text}")
+        raise HTTPError(f"Unsuccessful HTTP request /imports.\n{req.text}")
     operation_id = req.json()["id"]
 
     while True:
         req = requests.get(f"{URL}/v1/organizations/{organization_id}/operations/imports/{operation_id}",
                            headers={"X-Kontur-Apikey": APIKEY})
         if req.status_code != 200:
-            raise CustomError(f"Unsuccessful HTTP request /imports/operation_id. {req.text}")
+            raise HTTPError(f"Unsuccessful HTTP request /imports/operation_id.\n{req.text}")
         if req.json()['status'] in ("done", "error"):
             return req.json()
         time.sleep(polling_time_sec)
@@ -338,14 +341,14 @@ def async_revocation(revocation_file_path, signature_path, polling_time_sec=1):
                             headers={"X-Kontur-Apikey": APIKEY},
                             files={"revocation": revocation.read(), "signature": sig.read()})
         if req.status_code != 201:
-            raise CustomError(f"Unsuccessful HTTP request /revocations. {req.text}")
+            raise HTTPError(f"Unsuccessful HTTP request /revocations.\n{req.text}")
     operation_id = req.json()["id"]
 
     while True:
         req = requests.get(f"{URL}/v1/organizations/{organization_id}/operations/revocations/{operation_id}",
                            headers={"X-Kontur-Apikey": APIKEY})
         if req.status_code != 200:
-            raise CustomError(f"Unsuccessful HTTP request /revocations/operation_id. {req.text}")
+            raise HTTPError(f"Unsuccessful HTTP request /revocations/operation_id.\n{req.text}")
         if req.json()['status'] in ("done", "error"):
             return req.json()
         time.sleep(polling_time_sec)
@@ -409,19 +412,53 @@ def async_validation(principal: dict, poa_identity={}, representative={},
                         headers={"X-Kontur-Apikey": APIKEY},
                         json=payload)
     if req.status_code != 201:
-        raise CustomError(f"Unsuccessful HTTP request /validations. {req.text}")
+        raise HTTPError(f"Unsuccessful HTTP request /validations.\n{req.text}")
     operation_id = req.json()["id"]
 
     while True:
         req = requests.get(f"{URL}/v1/organizations/{organization_id}/operations/validations/{operation_id}",
                            headers={"X-Kontur-Apikey": APIKEY})
         if req.status_code != 200:
-            raise CustomError(f"Unsuccessful HTTP request /revocations/operation_id. {req.text}")
+            raise HTTPError(f"Unsuccessful HTTP request /validations/operation_id.\n{req.text}")
         if req.json()['status'] in ("done", "error"):
             return req.json()
         time.sleep(polling_time_sec)
 
 
+###
+# Свои наработки
+###
+
+
+def _get_poa(number, inn, datatype="archive"):
+    """Скачивание МЧД по номеру и ИННЮЛ"""
+
+    representative = {"name": "Иван",
+                      "surname": "Иванов",
+                      "middlename": "Иванович",
+                      "snils": "252-639-136 73",
+                      "inn": "477704523710"}
+    new_representative = {}
+    requisites = async_validation({"inn": inn, "kpp": f"{inn[:4]}01001"},
+                                  poa_identity={"number": number, "inn": inn},
+                                  representative=representative)
+    key_mapping = {"representativeInnDoesNotMatch": "inn",
+                   "representativeSnilsDoesNotMatch": "snils",
+                   "representativeFioDoesNotMatch": "Fio"}
+    for error in requisites["result"]["errors"]:
+        new_representative[key_mapping[error['code']]] = re.findall("'(.*?)'", error['message'])[1]
+    return async_download(number, inn, new_representative["inn"], datatype)
+
+
+def _get_poa_status(number):
+    """Запрос статуса МЧД по номеру"""
+
+    req = requests.get(f"https://m4d-cprr-it.gnivc.ru/api/v0/poar-portal/public/poa/{number}/public")
+    if req.status_code != 200:
+        raise HTTPError(f"Unsuccessful HTTP request /poa/number/public.\n{req.text}")
+    return req.json()["status"]
+
+    
 if __name__ == "__main__":
     organization_id = set_organization_id()
     # poa_identity = {"number": "31cc6eee-b565-4266-9097-2a8ac00ff444", "inn": "4401165141"}
