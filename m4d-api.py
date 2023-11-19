@@ -1,5 +1,7 @@
 from requests import HTTPError
+import subprocess
 import requests
+import secrets
 import base64
 import json
 import time
@@ -7,9 +9,30 @@ import os
 import re
 
 
-URL = "https://m4d-api-staging.testkontur.ru"  # Staging
-# URL = "https://m4d-api.kontur.ru"  # Production
-APIKEY = os.getenv("M4D-KONTUR-APIKEY")  # Личный APIKEY
+ENV = False
+URL = "https://m4d-api-staging.testkontur.ru"
+APIKEY = os.getenv("M4D-KONTUR-APIKEY")
+EXTERN_TOKEN = None  # Пока не используется
+EXTERN_TOKEN_TIME = 0  # Пока не используется
+
+
+def change_environment():
+    """Изменение окружения"""
+
+    global ENV, URL, APIKEY, organization_id
+
+    ENV = not ENV
+
+    if ENV:
+        URL = "https://m4d-api.kontur.ru" 
+        APIKEY = secrets.APIKEY
+        organization_id = secrets.organization_id
+        print("Production environment using")
+    else:
+        URL = "https://m4d-api-staging.testkontur.ru"
+        APIKEY = os.getenv("M4D-KONTUR-APIKEY")
+        organization_id = set_organization_id()
+        print("Staging environment using")
 
 
 class CustomError(Exception):
@@ -30,6 +53,75 @@ def to_camel_case_converter(string):
     """Конвертация snake_case строки в CamelCase строку"""
 
     return "".join(word.title() for word in string.split("_"))
+
+
+def get_extern_token():
+    """Получение ExternOIDCToken по Device Flow"""
+    # Плохая реализация. Требует участия пользователя каждый раз в браузере
+    # Переписать на получение по Client_Credentials или по логину/паролю на бэкенде
+    # Нужен только для регистрации МЧД ФНС и ФСС
+
+    from webbrowser import open_new_tab
+    global EXTERN_TOKEN, EXTERN_TOKEN_TIME
+
+    # Тут еще функция проверки срока действия токена
+    # Если жив - вернуть текущий. Если нет, запросить новый
+
+    def is_alive_token():
+        pass
+
+    identity_url = "https://identity.testkontur.ru"
+    req = requests.post(f"{identity_url}/connect/deviceauthorization",
+                        data={"client_id": secrets.client_id,
+                              "client_secret": secrets.client_secret,
+                              "scope": "extern.api"})
+    if req.status_code != 200:
+        raise HTTPError(f"{req.text}")
+    auth_data = req.json()
+
+    open_new_tab(auth_data['verification_uri_complete'])
+    device_code = auth_data["device_code"]
+
+    while True:
+        req = requests.post(f"{identity_url}/connect/token",
+                            data={"client_id": secrets.client_id,
+                                  "client_secret": secrets.client_secret,
+                                  "device_code": f"{device_code}",
+                                  "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                                  "scope": "extern.api"})
+        if req.status_code != 200:
+            if req.status_code == 400 and req.json()["error"] == "authorization_pending":
+                print("authorization_pending")
+                time.sleep(3)
+            else:
+                raise HTTPError(f"{req.text}")
+        else:
+            EXTERN_TOKEN = req.json()["access_token"]
+            return EXTERN_TOKEN
+
+
+def sign_file(filepath, rawsign=False):
+    """Подписание файла выбранным сертификатом"""
+    # Указание сертификата в secrets.py
+    # Для DetachesCMS подписи отпечаток сертификата
+    # Для RAW подписи FQCN имя контейнера
+
+    if rawsign:
+        # Нужна утилита csptest
+        command = f'csptest -keys -sign GOST12_256 -cont "\{secrets.container_name}" -keytype exchange -in {filepath} -out {filepath}.sig'
+    else:
+        # Нужна утилита cryptcp
+        command = f'cryptcp.x64.exe -sign -thumbprint {secrets.certificate_thumbprint} {filepath} -der -strict -detached -fext .sig'
+    subprocess.call(command, shell=True)
+
+
+def sign_file_with_rawsign(filepath, signpath, certificate=secrets.container_name):
+    """Подписание файла RAW подписью"""
+    # НЕ РЕАЛИЗОВАНО!!!
+    
+    command = f''
+    subprocess.call(command, shell=True)
+
 
 ####
 # Работа с организациями
@@ -65,6 +157,17 @@ def get_organization_info(org_id):
     for organization in organizations["organizations"]["items"]:
         if organization['id'] == org_id:
             return organization
+
+
+def get_operation_status(operation_id, operation_type="r"):
+    """Получение данных об операции"""
+
+    operations = {"r": "registrations", "i": "imports", "v": "validations", "rv": "revocations", "d": "downloads"}
+    req = requests.get(f"{URL}/v1/organizations/{organization_id}/operations/{operations[operation_type]}/{operation_id}",
+                       headers={"X-Kontur-Apikey": APIKEY})
+    if req.status_code != 200:
+        raise HTTPError(f"Unsuccessful HTTP request.\n{req.text}")
+    return req.json()
 
 
 ####
@@ -144,7 +247,7 @@ def validation_poa(principal: dict, poa_identity={}, representative={},
         "poaFiles": {},
         "syncTimeoutMs": sync_timeout_ms
     }
-
+    
     # Сначала валидация переданных параметров
     if not poa_files:
         if not poa_identity:
@@ -178,7 +281,6 @@ def validation_poa(principal: dict, poa_identity={}, representative={},
             raise CustomError("Должен быть указан только один параметр 'representative' или 'certificate_path'")
         payload["parameters"]["representative"]["requisites"] = representative
         payload["parameters"]["representative"]["certificate"] = None
-
     req = requests.post(f"{URL}/v1/organizations/{organization_id}/poas/validate-local",
                         headers={"X-KONTUR-APIKEY": APIKEY},
                         json=payload)
@@ -219,6 +321,17 @@ def create_draft_from_xml_file(path_to_file, send_to_sign=False):
     return req.json()["draftId"]
 
 
+def download_poa_draft(poa_number):
+    """ПЛАТНАЯ ФИЧА!! Скачивание черновика МЧД"""
+
+    with open(f"draft_{poa_number}.xml", "wb") as poa:
+        req = requests.get(f"{URL}/v1/organizations/{organization_id}/drafts/{poa_number}/xml",
+                           headers={"X-KONTUR-APIKEY": APIKEY})
+        if req.status_code != 200:
+            raise HTTPError(f"Unsuccessful HTTP request /poa_number/xml.\n{req.text}")
+        poa.write(req.content)
+
+
 ####
 # Работа с асинхронными методами API + поллинг до терминального статуса
 ####
@@ -233,6 +346,7 @@ def async_registration(poa_path, signature_path, polling_time_sec=1):
                             files={"poa": poa.read(), "signature": sig.read()})
         if req.status_code != 201:
             raise HTTPError(f"Unsuccessful HTTP request /registrations.\n{req.text}")
+    print(req.json())
     operation_id = req.json()["id"]
 
     while True:
@@ -284,6 +398,7 @@ def async_download(number, principal_inn, inn, datatype="archive", polling_time_
                         json=payload)
     if req.status_code != 201:
         raise HTTPError(f"Unsuccessful HTTP request /downloads.\n{req.text}")
+    print(req.json())
     operation_id = req.json()["id"]
 
     while True:
@@ -321,6 +436,7 @@ def async_import(number, principal_inn, inn, polling_time_sec=1):
                         json=payload)
     if req.status_code != 201:
         raise HTTPError(f"Unsuccessful HTTP request /imports.\n{req.text}")
+    print(req.json())
     operation_id = req.json()["id"]
 
     while True:
@@ -342,6 +458,7 @@ def async_revocation(revocation_file_path, signature_path, polling_time_sec=1):
                             files={"revocation": revocation.read(), "signature": sig.read()})
         if req.status_code != 201:
             raise HTTPError(f"Unsuccessful HTTP request /revocations.\n{req.text}")
+    print(req.json())
     operation_id = req.json()["id"]
 
     while True:
@@ -413,6 +530,7 @@ def async_validation(principal: dict, poa_identity={}, representative={},
                         json=payload)
     if req.status_code != 201:
         raise HTTPError(f"Unsuccessful HTTP request /validations.\n{req.text}")
+    print(req.json())
     operation_id = req.json()["id"]
 
     while True:
@@ -425,8 +543,153 @@ def async_validation(principal: dict, poa_identity={}, representative={},
         time.sleep(polling_time_sec)
 
 
+def async_registration_fns_poa(poa_path, signature_path, certificate_path,
+                               fns_code="0087", polling_time_sec=1):
+    """Регистрация МЧД для ФНС 5.01, 5.02"""
+    # НЕ ТЕСТИРОВАЛОСЬ!!! АЛЬФА ВЕРСИЯ!!!
+    
+    organization = get_organization_info(organization_id)["legalEntity"]
+    extern_token = get_extern_token()
+    payload ={
+         "fnsCode": fns_code,
+         "payerInn": organization["inn"],
+         "payerKpp": organization["kpp"],
+         "payerOgrn": organization["ogrn"],
+         "payerSnils": "25193743483",
+         "senderInn": organization["inn"],
+         "senderKpp": organization["kpp"],
+         "externAccountId": secrets.extern_account_id,
+         "senderCertificateContent": base64_encoder(certificate_path, True),
+         "senderIpAddress": requests.get("https://api.ipify.org").text
+         }
+    with open(poa_path, "rb") as poa, open(signature_path, "rb") as sig:
+        req = requests.post(f"{URL}/v1/organizations/{organization_id}/operations/fns/registrations",
+                            headers={"X-Kontur-Apikey": APIKEY,
+                                     "ExternOidcToken": extern_token},
+                            data=payload,
+                            files={"poa": poa.read(),
+                                   "signature": sig.read()})
+    if req.status_code != 201:
+        raise HTTPError(f"Unsuccessful HTTP request /fns/registrations.\n{req.text}")
+    print(req.json())
+    operation_id = req.json()["id"]
+
+    while True:
+        req = requests.get(f"{URL}/v1/organizations/{organization_id}/operations/fns/registrations/{operation_id}",
+                           headers={"X-Kontur-Apikey": APIKEY})
+        if req.status_code != 200:
+            raise HTTPError(f"Unsuccessful HTTP request /fns/registrations/operation_id.\n{req.text}")
+        if req.json()['status'] in ("done", "error"):
+            return req.json()
+        time.sleep(polling_time_sec)
+
+
+def async_registration_fss_poa(poa_path, signature_path, certificate_path,
+                               fss_code="00001", fss_reg_num="0001",
+                               polling_time_sec=1):
+    """Регистрация МЧД для ФСС"""
+    # НЕ ТЕСТИРОВАЛОСЬ!!! АЛЬФА ВЕРСИЯ!!!
+    # БЕЗ РЕАЛИЗАЦИИ ПОДПИСАНИЯ SOAP СООБЩЕНИЯ RAW ПОДПИСЬЮ В АВТОМАТИЧЕСКОМ РЕЖИМЕ РАБОТАТЬ НЕ БУДЕТ
+
+    organization = get_organization_info(organization_id)["legalEntity"]
+    extern_token = get_extern_token()
+    
+    def registration_soap_message():
+        """Создание SOAP сообщения для регистрации в ФСС"""
+       
+        payload ={
+             "fssCode": fss_code,
+             "fssRegistrationNumber": fss_reg_num,
+             "payerInn": organization["inn"],
+             "payerKpp": organization["kpp"],
+             "payerOgrn": organization["ogrn"],
+             "payerSnils": "25193743483",
+             "senderInn": organization["inn"],
+             "senderKpp": organization["kpp"],
+             "externAccountId": secrets.extern_account_id,
+             "senderCertificateContent": base64_encoder(certificate_path, True),
+             "senderIpAddress": requests.get("https://api.ipify.org").text
+             }
+        with open(poa_path, "rb") as poa, open(signature_path, "rb") as sig:
+            req = requests.post(f"{URL}/v1/organizations/{organization_id}/operations/fss/soap-messages",
+                                headers={"X-Kontur-Apikey": APIKEY,
+                                         "ExternOidcToken": extern_token},
+                                data=payload,
+                                files={"poa": poa.read(),
+                                       "signature": sig.read()})
+        if req.status_code != 201:
+            raise HTTPError(f"Unsuccessful HTTP request /fss/soap-messages.\n{req.text}")
+        print(req.json())
+        return req.json()["id"]
+
+    def get_soap_message_content(operation_id):
+        """Поллинг операции регистрации SOAP сообщения и получение контента"""
+
+        while True:
+            req = requests.get(f"{URL}/v1/organizations/{organization_id}/operations/fss/soap-messages/{operation_id}",
+                               headers={"X-Kontur-Apikey": APIKEY})
+            if req.status_code != 200:
+                raise HTTPError(f"Unsuccessful HTTP request /soap-messages/operation_id.\n{req.text}")
+            if req.json()['status'] == "error":
+                return req.json()
+            elif req.json()['status'] == "done":
+                with open(f"SOAP_fss_{poa_path.split('/')[-1]}.xml", "rb") as soap:
+                    req = requests.get(f"{URL}/v1/organizations/{organization_id}/operations/fss/soap-messages/{operation_id}/content",
+                                       headers={"X-Kontur-Apikey": APIKEY})
+                    if req.status_code != 200:
+                        raise HTTPError(f"Unsuccessful HTTP request /soap-messages/operation_id/content.\n{req.text}")
+                    soap.write(req.content)
+                    return
+            time.sleep(polling_time_sec)
+
+    def fss_poa_registration(draft_id, document_id):
+        """Регистрация МЧД для ФСС"""
+
+        organization = get_organization_info(organization_id)["legalEntity"]
+        payload ={
+            "externAccountId": secrets.extern_account_id,
+            "draftId": draft_id,
+            "documentId": document_id,
+            "base64SoapMessageSignature": base64_encoder(sign_file(f"SOAP_fss_{poa_path.split('/')[-1]}.xml", True), True),
+            "payerInn": organization["inn"]
+            }
+        with open(poa_path, "rb") as poa, open(signature_path, "rb") as sig:
+            req = requests.post(f"{URL}/v1/organizations/{organization_id}/operations/fss/registrations",
+                                headers={"X-Kontur-Apikey": APIKEY,
+                                         "ExternOidcToken": extern_token},
+                                data=payload,
+                                files={"poa": poa.read(),
+                                       "signature": sig.read()})
+        if req.status_code != 201:
+            raise HTTPError(f"Unsuccessful HTTP request /fss/registrations.\n{req.text}")
+        print(req.json())
+        operation_id = req.json()["id"]
+
+        while True:
+            req = requests.get(f"{URL}/v1/organizations/{organization_id}/operations/fss/registrations/{operation_id}",
+                               headers={"X-Kontur-Apikey": APIKEY,
+                                        "ExternOidcToken": extern_token})
+            if req.status_code != 200:
+                raise HTTPError(f"Unsuccessful HTTP request /fss/registrations/operation_id.\n{req.text}")
+            if req.json()['status'] in ("done", "error"):
+                return req.json()
+            time.sleep(polling_time_sec)
+
+    #####
+    # Main:
+    # 1. Создаем МЧД ФСС, подписываем
+    # 2. Создаем операцию регистрации SOAP сообщения
+    # 3. Отслеживаем операцию регистрации SOAP сообщения. Когда она успешно закончится, получаем Response.result.draftId и Response.result.documentId
+    # 4. Получаем контент SOAP сообщения
+    # 5. Получаем RAW подпись к SOAP сообщению
+    # 6. Подписываем SOAP сообщение RAW подписью (???)
+    # 7. Регистрируем операцию регистрации МЧД ФСС
+    # 8. Отслеживаем операцию регистрации
+    #####
+
+    
 ###
-# Свои наработки
+# Полезное
 ###
 
 
@@ -438,22 +701,27 @@ def _get_poa(number, inn, datatype="archive"):
                       "middlename": "Иванович",
                       "snils": "252-639-136 73",
                       "inn": "477704523710"}
-    new_representative = {}
     requisites = async_validation({"inn": inn, "kpp": f"{inn[:4]}01001"},
                                   poa_identity={"number": number, "inn": inn},
                                   representative=representative)
-    key_mapping = {"representativeInnDoesNotMatch": "inn",
-                   "representativeSnilsDoesNotMatch": "snils",
-                   "representativeFioDoesNotMatch": "Fio"}
-    for error in requisites["result"]["errors"]:
-        new_representative[key_mapping[error['code']]] = re.findall("'(.*?)'", error['message'])[1]
-    return async_download(number, inn, new_representative["inn"], datatype)
+    key_mapping = {"representativeInnDoesNotMatch": "inn"}
+    try:
+        for error in requisites["result"]["errors"]:
+            if error['code'] == "representativeInnDoesNotMatch":
+                actual_inn = re.findall("'(.*?)'", error['message'])[1]
+                break
+        return async_download(number, inn, actual_inn, datatype)
+    except KeyError:
+        return f"KeyError has occured.\n{requisites=}"
 
 
 def _get_poa_status(number):
     """Запрос статуса МЧД по номеру"""
 
-    req = requests.get(f"https://m4d-cprr-it.gnivc.ru/api/v0/poar-portal/public/poa/{number}/public")
+    if not ENV:
+        req = requests.get(f"https://m4d-cprr-it.gnivc.ru/api/v0/poar-portal/public/poa/{number}/public")
+    else:
+        req = requests.get(f"https://m4d.nalog.gov.ru/api/v0/poar-portal/public/poa/{number}/public")
     if req.status_code != 200:
         raise HTTPError(f"Unsuccessful HTTP request /poa/number/public.\n{req.text}")
     return req.json()["status"]
