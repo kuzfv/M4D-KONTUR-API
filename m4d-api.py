@@ -12,8 +12,12 @@ import re
 ENV = False
 URL = "https://m4d-api-staging.testkontur.ru"
 APIKEY = os.getenv("M4D-KONTUR-APIKEY")
-EXTERN_TOKEN = None  # Пока не используется
+EXTERN_TOKEN = None
 EXTERN_TOKEN_TIME = 0  # Пока не используется
+
+
+class CustomError(Exception):
+    """Класс для описания ошибок"""
 
 
 def change_environment():
@@ -35,10 +39,6 @@ def change_environment():
         print("Staging environment using")
 
 
-class CustomError(Exception):
-    """Класс для описания ошибок"""
-
-
 def base64_encoder(filepath, decode=False):
     """Конвертация контента файла в Base64"""
 
@@ -55,10 +55,20 @@ def to_camel_case_converter(string):
     return "".join(word.title() for word in string.split("_"))
 
 
+def get_extern_account_id():
+    """Получение Id аккаунта в Экстерне"""
+    
+    req = requests.get("https://extern-api.testkontur.ru/v1",
+                       headers={"Authorization": f"Bearer {EXTERN_TOKEN}"})
+    if req.status_code != 200:
+        raise HTTPError(f"Unsuccessful HTTP request /v1.\n{req.text}")
+    return req.json()["accounts"][0]["id"]
+
+
 def get_extern_token():
     """Получение ExternOIDCToken по Device Flow"""
     # Плохая реализация. Требует участия пользователя каждый раз в браузере
-    # Переписать на получение по Client_Credentials или по логину/паролю на бэкенде
+    # Переписать на получение по логину/паролю на бэкенде
     # Нужен только для регистрации МЧД ФНС и ФСС
 
     from webbrowser import open_new_tab
@@ -108,18 +118,14 @@ def sign_file(filepath, rawsign=False):
 
     if rawsign:
         # Нужна утилита csptest
+        if not os.path.exists("./csptest.exe"):
+            raise CustomError("Не найдена утилита csptest")
         command = f'csptest -keys -sign GOST12_256 -cont "\{secrets.container_name}" -keytype exchange -in {filepath} -out {filepath}.sig'
     else:
         # Нужна утилита cryptcp
+        if not os.path.exists("./cryptcp.x64.exe"):
+            raise CustomError("Не найдена утилита cryptcp")
         command = f'cryptcp.x64.exe -sign -thumbprint {secrets.certificate_thumbprint} {filepath} -der -strict -detached -fext .sig'
-    subprocess.call(command, shell=True)
-
-
-def sign_file_with_rawsign(filepath, signpath, certificate=secrets.container_name):
-    """Подписание файла RAW подписью"""
-    # НЕ РЕАЛИЗОВАНО!!!
-    
-    command = f''
     subprocess.call(command, shell=True)
 
 
@@ -543,19 +549,16 @@ def async_validation(principal: dict, poa_identity={}, representative={},
         time.sleep(polling_time_sec)
 
 
-def async_registration_fns_poa(poa_path, signature_path, certificate_path,
-                               fns_code="0087", polling_time_sec=1):
+def async_registration_fns_poa(poa_path, signature_path, certificate_path, fns_code="0087", polling_time_sec=1):
     """Регистрация МЧД для ФНС 5.01, 5.02"""
-    # НЕ ТЕСТИРОВАЛОСЬ!!! АЛЬФА ВЕРСИЯ!!!
     
     organization = get_organization_info(organization_id)["legalEntity"]
-    extern_token = get_extern_token()
     payload ={
          "fnsCode": fns_code,
          "payerInn": organization["inn"],
          "payerKpp": organization["kpp"],
          "payerOgrn": organization["ogrn"],
-         "payerSnils": "25193743483",
+         "payerSnils": "17097865012",
          "senderInn": organization["inn"],
          "senderKpp": organization["kpp"],
          "externAccountId": secrets.extern_account_id,
@@ -565,7 +568,7 @@ def async_registration_fns_poa(poa_path, signature_path, certificate_path,
     with open(poa_path, "rb") as poa, open(signature_path, "rb") as sig:
         req = requests.post(f"{URL}/v1/organizations/{organization_id}/operations/fns/registrations",
                             headers={"X-Kontur-Apikey": APIKEY,
-                                     "ExternOidcToken": extern_token},
+                                     "ExternOidcToken": EXTERN_TOKEN},
                             data=payload,
                             files={"poa": poa.read(),
                                    "signature": sig.read()})
@@ -576,27 +579,26 @@ def async_registration_fns_poa(poa_path, signature_path, certificate_path,
 
     while True:
         req = requests.get(f"{URL}/v1/organizations/{organization_id}/operations/fns/registrations/{operation_id}",
-                           headers={"X-Kontur-Apikey": APIKEY})
+                           headers={"X-Kontur-Apikey": APIKEY,
+                                    "ExternOidcToken": EXTERN_TOKEN})
         if req.status_code != 200:
             raise HTTPError(f"Unsuccessful HTTP request /fns/registrations/operation_id.\n{req.text}")
         if req.json()['status'] in ("done", "error"):
+            print(f"TraceId - {req.headers['X-Kontur-Trace-Id']}")
             return req.json()
         time.sleep(polling_time_sec)
 
 
 def async_registration_fss_poa(poa_path, signature_path, certificate_path,
-                               fss_code="00001", fss_reg_num="0001",
+                               fss_code="99991", fss_reg_num="9988877766",
                                polling_time_sec=1):
     """Регистрация МЧД для ФСС"""
-    # НЕ ТЕСТИРОВАЛОСЬ!!! АЛЬФА ВЕРСИЯ!!!
-    # БЕЗ РЕАЛИЗАЦИИ ПОДПИСАНИЯ SOAP СООБЩЕНИЯ RAW ПОДПИСЬЮ В АВТОМАТИЧЕСКОМ РЕЖИМЕ РАБОТАТЬ НЕ БУДЕТ
 
     organization = get_organization_info(organization_id)["legalEntity"]
-    extern_token = get_extern_token()
     
     def registration_soap_message():
         """Создание SOAP сообщения для регистрации в ФСС"""
-       
+
         payload ={
              "fssCode": fss_code,
              "fssRegistrationNumber": fss_reg_num,
@@ -613,7 +615,7 @@ def async_registration_fss_poa(poa_path, signature_path, certificate_path,
         with open(poa_path, "rb") as poa, open(signature_path, "rb") as sig:
             req = requests.post(f"{URL}/v1/organizations/{organization_id}/operations/fss/soap-messages",
                                 headers={"X-Kontur-Apikey": APIKEY,
-                                         "ExternOidcToken": extern_token},
+                                         "ExternOidcToken": EXTERN_TOKEN},
                                 data=payload,
                                 files={"poa": poa.read(),
                                        "signature": sig.read()})
@@ -622,7 +624,7 @@ def async_registration_fss_poa(poa_path, signature_path, certificate_path,
         print(req.json())
         return req.json()["id"]
 
-    def get_soap_message_content(operation_id):
+    def get_soap_message_operation(operation_id):
         """Поллинг операции регистрации SOAP сообщения и получение контента"""
 
         while True:
@@ -633,33 +635,32 @@ def async_registration_fss_poa(poa_path, signature_path, certificate_path,
             if req.json()['status'] == "error":
                 return req.json()
             elif req.json()['status'] == "done":
-                with open(f"SOAP_fss_{poa_path.split('/')[-1]}.xml", "rb") as soap:
+                data = req.json()["result"]
+                with open(f"SOAP_fss_{poa_path.split('/')[-1]}.xml", "wb") as soap:
                     req = requests.get(f"{URL}/v1/organizations/{organization_id}/operations/fss/soap-messages/{operation_id}/content",
-                                       headers={"X-Kontur-Apikey": APIKEY})
+                                       headers={"X-Kontur-Apikey": APIKEY,
+                                                "ExternOidcToken": EXTERN_TOKEN})
                     if req.status_code != 200:
                         raise HTTPError(f"Unsuccessful HTTP request /soap-messages/operation_id/content.\n{req.text}")
                     soap.write(req.content)
-                    return
+                    return data
             time.sleep(polling_time_sec)
 
     def fss_poa_registration(draft_id, document_id):
         """Регистрация МЧД для ФСС"""
 
-        organization = get_organization_info(organization_id)["legalEntity"]
         payload ={
             "externAccountId": secrets.extern_account_id,
             "draftId": draft_id,
             "documentId": document_id,
-            "base64SoapMessageSignature": base64_encoder(sign_file(f"SOAP_fss_{poa_path.split('/')[-1]}.xml", True), True),
+            "base64SoapMessageSignature": base64_encoder(f"SOAP_fss_{poa_path.split('/')[-1]}.xml.sig", True),
             "payerInn": organization["inn"]
             }
         with open(poa_path, "rb") as poa, open(signature_path, "rb") as sig:
             req = requests.post(f"{URL}/v1/organizations/{organization_id}/operations/fss/registrations",
                                 headers={"X-Kontur-Apikey": APIKEY,
-                                         "ExternOidcToken": extern_token},
-                                data=payload,
-                                files={"poa": poa.read(),
-                                       "signature": sig.read()})
+                                         "ExternOidcToken": EXTERN_TOKEN},
+                                json=payload)
         if req.status_code != 201:
             raise HTTPError(f"Unsuccessful HTTP request /fss/registrations.\n{req.text}")
         print(req.json())
@@ -668,26 +669,19 @@ def async_registration_fss_poa(poa_path, signature_path, certificate_path,
         while True:
             req = requests.get(f"{URL}/v1/organizations/{organization_id}/operations/fss/registrations/{operation_id}",
                                headers={"X-Kontur-Apikey": APIKEY,
-                                        "ExternOidcToken": extern_token})
+                                        "ExternOidcToken": EXTERN_TOKEN})
             if req.status_code != 200:
                 raise HTTPError(f"Unsuccessful HTTP request /fss/registrations/operation_id.\n{req.text}")
             if req.json()['status'] in ("done", "error"):
                 return req.json()
             time.sleep(polling_time_sec)
 
-    #####
-    # Main:
-    # 1. Создаем МЧД ФСС, подписываем
-    # 2. Создаем операцию регистрации SOAP сообщения
-    # 3. Отслеживаем операцию регистрации SOAP сообщения. Когда она успешно закончится, получаем Response.result.draftId и Response.result.documentId
-    # 4. Получаем контент SOAP сообщения
-    # 5. Получаем RAW подпись к SOAP сообщению
-    # 6. Подписываем SOAP сообщение RAW подписью (???)
-    # 7. Регистрируем операцию регистрации МЧД ФСС
-    # 8. Отслеживаем операцию регистрации
-    #####
+    soap_operation_id = registration_soap_message()
+    document_info = get_soap_message_operation(soap_operation_id)
+    sign_file(f"SOAP_fss_{poa_path.split('/')[-1]}.xml", True)
+    return fss_poa_registration(document_info["draftId"], document_info["documentId"])
 
-    
+
 ###
 # Полезное
 ###
@@ -728,7 +722,7 @@ def _get_poa_status(number):
 
     
 if __name__ == "__main__":
-    organization_id = set_organization_id()
+    organization_id = set_organization_id(2)
     # poa_identity = {"number": "31cc6eee-b565-4266-9097-2a8ac00ff444", "inn": "4401165141"}
     # principal = {"inn": "4401165141", "kpp": "440101001"}
     # representative = {"name": "Иван", "surname": "Иванов", "snils": "252-639-136 73", "inn": "477704523710"}
