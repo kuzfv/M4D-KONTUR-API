@@ -1,10 +1,12 @@
 from requests import HTTPError
+from pprint import pprint
 import subprocess
 import requests
 import secrets
 import base64
 import json
 import time
+import bs4
 import os
 import re
 
@@ -13,6 +15,7 @@ ENV = False
 URL = "https://m4d-api-staging.testkontur.ru"
 APIKEY = os.getenv("M4D-KONTUR-APIKEY")
 EXTERN_TOKEN = None
+EXTERN_REFRESH_TOKEN = None
 EXTERN_TOKEN_TIME = 0  # Пока не используется
 
 
@@ -67,12 +70,10 @@ def get_extern_account_id():
 
 def get_extern_token():
     """Получение ExternOIDCToken по Device Flow"""
-    # Плохая реализация. Требует участия пользователя каждый раз в браузере
-    # Переписать на получение по логину/паролю на бэкенде
     # Нужен только для регистрации МЧД ФНС и ФСС
 
     from webbrowser import open_new_tab
-    global EXTERN_TOKEN, EXTERN_TOKEN_TIME
+    global EXTERN_TOKEN, EXTERN_REFRESH_TOKEN
 
     # Тут еще функция проверки срока действия токена
     # Если жив - вернуть текущий. Если нет, запросить новый
@@ -84,7 +85,7 @@ def get_extern_token():
     req = requests.post(f"{identity_url}/connect/deviceauthorization",
                         data={"client_id": secrets.client_id,
                               "client_secret": secrets.client_secret,
-                              "scope": "extern.api"})
+                              "scope": "extern.api offline_access"})
     if req.status_code != 200:
         raise HTTPError(f"{req.text}")
     auth_data = req.json()
@@ -98,7 +99,7 @@ def get_extern_token():
                                   "client_secret": secrets.client_secret,
                                   "device_code": f"{device_code}",
                                   "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                                  "scope": "extern.api"})
+                                  "scope": "extern.api offline_access"})
         if req.status_code != 200:
             if req.status_code == 400 and req.json()["error"] == "authorization_pending":
                 print("authorization_pending")
@@ -107,7 +108,28 @@ def get_extern_token():
                 raise HTTPError(f"{req.text}")
         else:
             EXTERN_TOKEN = req.json()["access_token"]
+            EXTERN_REFRESH_TOKEN = req.json()["refresh_token"]
             return EXTERN_TOKEN
+
+
+def refresh_extern_token():
+    """Обновление токена по Refresh Token"""
+
+    global EXTERN_TOKEN, EXTERN_REFRESH_TOKEN
+
+    identity_url = "https://identity.testkontur.ru"
+    req = requests.post(f"{identity_url}/connect/token",
+                        data={"client_id": secrets.client_id,
+                              "client_secret": secrets.client_secret,
+                              "scope": "extern.api offline_access",
+                              "grant_type": "refresh_token",
+                              "refresh_token": EXTERN_REFRESH_TOKEN})
+    if req.status_code != 200:
+        raise HTTPError(f"{req.text}")
+    else:
+        EXTERN_TOKEN = req.json()["access_token"]
+        EXTERN_REFRESH_TOKEN = req.json()["refresh_token"]
+        return EXTERN_TOKEN
 
 
 def sign_file(filepath, rawsign=False):
@@ -398,7 +420,7 @@ def async_download(number, principal_inn, inn, datatype="archive", polling_time_
             }
         }
     }
-
+    print(payload)
     req = requests.post(f"{URL}/v1/organizations/{organization_id}/operations/downloads",
                         headers={"X-Kontur-Apikey": APIKEY},
                         json=payload)
@@ -605,7 +627,7 @@ def async_registration_fss_poa(poa_path, signature_path, certificate_path,
              "payerInn": organization["inn"],
              "payerKpp": organization["kpp"],
              "payerOgrn": organization["ogrn"],
-             "payerSnils": "25193743483",
+             # "payerSnils": "25193743483",
              "senderInn": organization["inn"],
              "senderKpp": organization["kpp"],
              "externAccountId": secrets.extern_account_id,
@@ -621,7 +643,8 @@ def async_registration_fss_poa(poa_path, signature_path, certificate_path,
                                        "signature": sig.read()})
         if req.status_code != 201:
             raise HTTPError(f"Unsuccessful HTTP request /fss/soap-messages.\n{req.text}")
-        print(req.json())
+        print(f"TraceId CREATE SOAP MESSAGE - {req.headers['X-Kontur-Trace-Id']}")
+        pprint(req.json())
         return req.json()["id"]
 
     def get_soap_message_operation(operation_id):
@@ -649,21 +672,24 @@ def async_registration_fss_poa(poa_path, signature_path, certificate_path,
     def fss_poa_registration(draft_id, document_id):
         """Регистрация МЧД для ФСС"""
 
+        with open(f"SOAP_fss_{poa_path.split('/')[-1]}.xml.sig", "rb") as raw_signature:
+            raw_bytes = bytearray(raw_signature.read())
+            raw_bytes.reverse()
         payload ={
             "externAccountId": secrets.extern_account_id,
             "draftId": draft_id,
             "documentId": document_id,
-            "base64SoapMessageSignature": base64_encoder(f"SOAP_fss_{poa_path.split('/')[-1]}.xml.sig", True),
+            "base64SoapMessageSignature": base64.b64encode(bytes(raw_bytes)).decode(),
             "payerInn": organization["inn"]
             }
-        with open(poa_path, "rb") as poa, open(signature_path, "rb") as sig:
-            req = requests.post(f"{URL}/v1/organizations/{organization_id}/operations/fss/registrations",
-                                headers={"X-Kontur-Apikey": APIKEY,
-                                         "ExternOidcToken": EXTERN_TOKEN},
-                                json=payload)
+        req = requests.post(f"{URL}/v1/organizations/{organization_id}/operations/fss/registrations",
+                            headers={"X-Kontur-Apikey": APIKEY,
+                                     "ExternOidcToken": EXTERN_TOKEN},
+                            json=payload)
         if req.status_code != 201:
             raise HTTPError(f"Unsuccessful HTTP request /fss/registrations.\n{req.text}")
-        print(req.json())
+        print(f"TraceId REGISTRATION FSS POA - {req.headers['X-Kontur-Trace-Id']}")
+        pprint(req.json())
         operation_id = req.json()["id"]
 
         while True:
@@ -720,6 +746,22 @@ def _get_poa_status(number):
         raise HTTPError(f"Unsuccessful HTTP request /poa/number/public.\n{req.text}")
     return req.json()["status"]
 
+
+def _validation_poa_files(poa_path, sign_path):
+    """Валидация МЧД по файлам"""
+
+    with open(poa_path, "rb") as xml:
+        content = bs4.BeautifulSoup(xml.read(), "xml")
+    
+    return async_validation({"inn": content.СвРосОрг.attrs["ИННЮЛ"],
+                             "kpp": content.СвРосОрг.attrs["КПП"]},
+                            poa_files=[poa_path, sign_path],
+                            representative={"inn": content.СведФизЛ.attrs["ИННФЛ"],
+                                            "snils": content.СведФизЛ.attrs["СНИЛС"],
+                                            "name": content.СведФизЛ.ФИО.attrs["Имя"],
+                                            "surname": content.СведФизЛ.ФИО.attrs["Фамилия"],
+                                            "middlename": content.СведФизЛ.ФИО.attrs["Отчество"]}
+                            )
     
 if __name__ == "__main__":
     organization_id = set_organization_id(2)
